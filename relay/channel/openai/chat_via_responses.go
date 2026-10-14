@@ -37,8 +37,8 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
-	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	if apiErr := upstreamBodyError(responsesResp.GetOpenAIError(), resp.StatusCode); apiErr != nil {
+		return nil, apiErr
 	}
 
 	info.ObserveResponseModel(responsesResp.Model)
@@ -60,6 +60,9 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	defer service.CloseResponseBodyGracefully(resp)
+	if apiErr := upstreamJSONStreamBodyError(resp); apiErr != nil {
+		return nil, apiErr
+	}
 
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	info.StreamStatus.RequireTerminal()
@@ -83,6 +86,11 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 			continue
 		}
 
+		// Nothing reaches the client before the stream ends, so a rate limit
+		// on any event can still be retried on another channel.
+		if streamErr = streamFrameRateLimitError(data); streamErr != nil {
+			break
+		}
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, common.LogText("failed to unmarshal buffered responses stream event: %s", err.Error()))
@@ -175,6 +183,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+	if apiErr := upstreamJSONStreamBodyError(resp); apiErr != nil {
+		return nil, apiErr
+	}
 
 	responseId := helper.GetResponseID(c)
 	createAt := time.Now().Unix()
@@ -191,6 +202,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	// failedUsage the usage it reported, if any.
 	upstreamFailed := false
 	var failedUsage *dto.Usage
+	// forwarded marks that the first upstream event has been seen; a rate
+	// limit before it is retried because the client has received nothing.
+	forwarded := false
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo == nil {
 		info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
@@ -267,6 +281,13 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if streamErr != nil {
 			stopStream(sr, streamErr)
 			return
+		}
+		if !forwarded {
+			forwarded = true
+			if streamErr = streamFrameRateLimitError(data); streamErr != nil {
+				stopStream(sr, streamErr)
+				return
+			}
 		}
 
 		var streamResp dto.ResponsesStreamResponse

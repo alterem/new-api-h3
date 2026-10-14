@@ -32,8 +32,8 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
+	if apiErr := upstreamBodyError(responsesResponse.GetOpenAIError(), resp.StatusCode); apiErr != nil {
+		return nil, apiErr
 	}
 
 	info.ObserveResponseModel(responsesResponse.Model)
@@ -74,10 +74,21 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+	if apiErr := upstreamJSONStreamBodyError(resp); apiErr != nil {
+		return nil, apiErr
+	}
 
 	accumulator := service.NewResponsesUsageAccumulator(info)
+	forwarded := false
+	var firstFrameErr *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if !forwarded {
+			if firstFrameErr = streamFrameRateLimitError(data); firstFrameErr != nil {
+				sr.Stop(firstFrameErr)
+				return
+			}
+		}
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
@@ -90,8 +101,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
 		sendResponsesStreamData(c, streamResponse, data)
+		forwarded = true
 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 	})
+	if firstFrameErr != nil {
+		return nil, firstFrameErr
+	}
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
