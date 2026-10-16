@@ -73,8 +73,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 
 	var (
-		newAPIError *types.NewAPIError
-		ws          *websocket.Conn
+		newAPIError         *types.NewAPIError
+		ws                  *websocket.Conn
+		upstreamRateLimited bool
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
@@ -91,18 +92,19 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
-			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			clientError := publicRelayError(c, newAPIError, upstreamRateLimited)
+			clientError.SetMessage(common.MessageWithRequestId(clientError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError())
+				helper.WssError(c, ws, clientError.ToOpenAIError())
 			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
+				c.JSON(clientError.StatusCode, gin.H{
 					"type":  "error",
-					"error": newAPIError.ToClaudeError(),
+					"error": clientError.ToClaudeError(),
 				})
 			default:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(),
+				c.JSON(clientError.StatusCode, gin.H{
+					"error": clientError.ToOpenAIError(),
 				})
 			}
 		}
@@ -157,6 +159,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		upstreamRateLimited = false
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
@@ -201,6 +204,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.LastError = nil
 			return
 		}
+		upstreamRateLimited = newAPIError.StatusCode == http.StatusTooManyRequests
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
@@ -219,6 +223,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryLogStr := common.LogText("retry: %s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
 		logger.LogInfo(c, retryLogStr)
 	}
+}
+
+// publicRelayError keeps the upstream failure for retries and admin logs, but
+// does not disclose upstream rate-limit details (such as organization IDs) to
+// the client after retries are exhausted.
+func publicRelayError(c *gin.Context, apiErr *types.NewAPIError, upstreamRateLimited bool) *types.NewAPIError {
+	if !upstreamRateLimited || apiErr.StatusCode != http.StatusTooManyRequests {
+		return apiErr
+	}
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: i18n.T(c, i18n.MsgRelayGroupUpstreamSaturated),
+		Type:    "upstream_error",
+		Code:    "rate_limit_exceeded",
+	}, http.StatusTooManyRequests)
 }
 
 // CountClaudeTokens implements Anthropic's token-counting utility endpoint.

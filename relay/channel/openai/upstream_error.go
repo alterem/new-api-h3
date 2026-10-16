@@ -54,11 +54,12 @@ func isRateLimitError(oaiError *types.OpenAIError) bool {
 		strings.Contains(text, "too many requests")
 }
 
-// streamFrameRateLimitError reports a rate limit carried by one SSE data
-// frame: a chat error envelope, a Responses "error" event, or a failed
-// Responses event. Stream handlers check the first frame, before anything has
-// been forwarded to the client, so the request can still be retried.
+// streamFrameRateLimitError reports a rate limit carried by the first SSE
+// data frame. Some compatible upstreams send plain text instead of JSON.
 func streamFrameRateLimitError(data string) *types.NewAPIError {
+	if isPlainRateLimit(data) {
+		return types.WithOpenAIError(types.OpenAIError{Message: data, Code: "rate_limit_exceeded"}, http.StatusTooManyRequests)
+	}
 	var frame struct {
 		Type     string `json:"type"`
 		Code     any    `json:"code"`
@@ -79,6 +80,8 @@ func streamFrameRateLimitError(data string) *types.NewAPIError {
 		oaiError = &types.OpenAIError{Message: frame.Message, Code: frame.Code}
 	case frame.Response != nil && frame.Response.Error != nil:
 		oaiError = dto.GetOpenAIError(frame.Response.Error)
+	case frame.Message != "" && isPlainRateLimit(frame.Message):
+		oaiError = &types.OpenAIError{Message: frame.Message, Code: "rate_limit_exceeded"}
 	}
 	if !isRateLimitError(oaiError) {
 		return nil
@@ -86,12 +89,22 @@ func streamFrameRateLimitError(data string) *types.NewAPIError {
 	return types.WithOpenAIError(*oaiError, http.StatusTooManyRequests)
 }
 
+func isPlainRateLimit(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	return strings.HasPrefix(text, "rate limit exceeded:") ||
+		strings.HasPrefix(text, "rate limit reached for ")
+}
+
 // upstreamJSONStreamBodyError detects a stream request answered with a JSON
 // error body instead of SSE events. The stream scanner reads only "data:"
 // lines, so such a body would otherwise end as an empty successful stream.
 // Any other body is restored unchanged for the stream handler.
 func upstreamJSONStreamBodyError(resp *http.Response) *types.NewAPIError {
-	if resp == nil || resp.Body == nil || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "json") && !strings.HasPrefix(contentType, "text/plain") {
 		return nil
 	}
 	original := resp.Body
@@ -103,11 +116,27 @@ func upstreamJSONStreamBodyError(resp *http.Response) *types.NewAPIError {
 	if err != nil {
 		return nil
 	}
-	var envelope struct {
-		Error any `json:"error"`
-	}
-	if common.Unmarshal(head, &envelope) != nil {
+	if strings.HasPrefix(contentType, "text/plain") {
+		if isPlainRateLimit(string(head)) {
+			return types.WithOpenAIError(types.OpenAIError{Message: string(head), Code: "rate_limit_exceeded"}, http.StatusTooManyRequests)
+		}
 		return nil
 	}
-	return upstreamBodyError(dto.GetOpenAIError(envelope.Error), resp.StatusCode)
+	var envelope struct {
+		Error   any    `json:"error"`
+		Message string `json:"message"`
+	}
+	if common.Unmarshal(head, &envelope) != nil {
+		if isPlainRateLimit(string(head)) {
+			return types.WithOpenAIError(types.OpenAIError{Message: string(head), Code: "rate_limit_exceeded"}, http.StatusTooManyRequests)
+		}
+		return nil
+	}
+	if apiErr := upstreamBodyError(dto.GetOpenAIError(envelope.Error), resp.StatusCode); apiErr != nil {
+		return apiErr
+	}
+	if isPlainRateLimit(envelope.Message) {
+		return types.WithOpenAIError(types.OpenAIError{Message: envelope.Message, Code: "rate_limit_exceeded"}, http.StatusTooManyRequests)
+	}
+	return nil
 }

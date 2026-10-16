@@ -27,7 +27,7 @@ func TestDoResponseTreatsRateLimitInSuccessBodyAsRetryable429(t *testing.T) {
 	constant.StreamingTimeout = 30
 	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
 
-	const tpm = `Rate limit reached for gpt-6-astra in organization org-x on tokens per min (TPM): Limit 30000, Used 30000, Requested 100.`
+	const tpm = `rate limit exceeded: Rate limit reached for gpt-6.1-sol in organization org-test-upstream-limited on tokens per min (TPM): Limit 40000000, Used 39920237, Requested 203475. Please try again in 185ms. Visit https://platform.openai.com/account/rate-limits to learn more.`
 	chatError := `{"error":{"message":"` + tpm + `","type":"tokens","param":null,"code":"rate_limit_exceeded"}}`
 	messageOnly := `{"error":{"message":"` + tpm + `"}}`
 	sse := func(frames ...string) string {
@@ -53,11 +53,18 @@ func TestDoResponseTreatsRateLimitInSuccessBodyAsRetryable429(t *testing.T) {
 		{name: "chat json without type", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, contentType: "application/json", body: messageOnly, wantStatus: 429},
 		{name: "chat json other error keeps status", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, contentType: "application/json", body: `{"error":{"message":"bad","type":"invalid_request_error"}}`, wantStatus: 200},
 		{name: "chat stream first frame", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(chatError), wantStatus: 429},
+		{name: "chat stream plain text first frame", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(tpm), wantStatus: 429},
+		{name: "chat stream string error first frame", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(`{"error":"` + tpm + `"}`), wantStatus: 429},
+		{name: "chat stream top-level message first frame", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(`{"message":"` + tpm + `"}`), wantStatus: 429},
 		{name: "chat stream json body", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "application/json", body: chatError, wantStatus: 429},
+		{name: "chat stream json top-level message", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "application/json", body: `{"message":"` + tpm + `"}`, wantStatus: 429},
+		{name: "chat stream json plain error", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "application/json", body: tpm, wantStatus: 429},
+		{name: "chat stream plain text body", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/plain", body: tpm, wantStatus: 429},
 		{name: "chat stream normal", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(chatChunk)},
 		{name: "chat stream rate limit text after output", mode: relayconstant.RelayModeChatCompletions, format: types.RelayFormatOpenAI, stream: true, contentType: "text/event-stream", body: sse(chatChunk, chatError)},
 		{name: "responses json", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, contentType: "application/json", body: chatError, wantStatus: 429},
 		{name: "responses stream error event", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, stream: true, contentType: "text/event-stream", body: sse(`{"type":"error","code":"rate_limit_exceeded","message":"` + tpm + `"}`), wantStatus: 429},
+		{name: "responses stream plain text first frame", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, stream: true, contentType: "text/event-stream", body: sse(tpm), wantStatus: 429},
 		{name: "responses stream failed event", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, stream: true, contentType: "text/event-stream", body: sse(`{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"rate_limit_exceeded","message":"` + tpm + `"}}}`), wantStatus: 429},
 		{name: "responses stream json body", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, stream: true, contentType: "application/json", body: chatError, wantStatus: 429},
 		{name: "responses stream normal", mode: relayconstant.RelayModeResponses, format: types.RelayFormatOpenAIResponses, stream: true, contentType: "text/event-stream", body: sse(`{"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)},
@@ -94,6 +101,7 @@ func TestDoResponseTreatsRateLimitInSuccessBodyAsRetryable429(t *testing.T) {
 			assert.Equal(t, tt.wantStatus, apiErr.StatusCode)
 			if tt.wantStatus == 429 {
 				assert.Contains(t, apiErr.Error(), "Rate limit reached", "upstream message is kept")
+				assert.Contains(t, apiErr.Error(), "org-test-upstream-limited")
 			}
 			assert.Empty(t, recorder.Body.String(), "nothing reaches the client before the retry decision")
 			assert.Equal(t, tt.wantStatus == 429, service.ShouldRetryRelayError(c, apiErr, 1))

@@ -2,15 +2,19 @@ package controller
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -18,6 +22,70 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestPublicRelayErrorHidesUpstream429AfterRetries(t *testing.T) {
+	const detail = "rate limit exceeded: Rate limit reached for gpt-6.1-sol in organization org-test-upstream-limited on tokens per min (TPM): Limit 40000000, Used 39920237, Requested 203475. Please try again in 185ms. Visit https://platform.openai.com/account/rate-limits to learn more."
+	gin.SetMode(gin.TestMode)
+	require.NoError(t, i18n.Init())
+	cases := []struct {
+		name     string
+		language string
+		status   int
+		upstream bool
+		want     string
+	}{
+		{"upstream 429 English", "en", 429, true, "The upstream of the current group is at capacity. Please try again later"},
+		{"upstream 429 Chinese", "zh-CN", 429, true, "当前分组"},
+		{"local 429 unchanged", "en", 429, false, "rate limit exceeded: Rate limit reached for gpt-6.1-sol"},
+		{"other upstream error unchanged", "en", 500, true, "rate limit exceeded: Rate limit reached for gpt-6.1-sol"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			ctx.Request.Header.Set("Accept-Language", tc.language)
+			original := types.WithOpenAIError(types.OpenAIError{Message: detail, Type: "tokens", Code: "rate_limit_exceeded"}, tc.status)
+			public := publicRelayError(ctx, original, tc.upstream)
+			assert.Equal(t, detail, original.Error())
+			public.SetMessage(common.MessageWithRequestId(public.Error(), "request-1"))
+			assert.Equal(t, tc.status, public.StatusCode)
+			assert.Contains(t, public.ToOpenAIError().Message, tc.want)
+			assert.Contains(t, public.ToClaudeError().Message, tc.want)
+			if tc.upstream && tc.status == http.StatusTooManyRequests {
+				assert.Equal(t, i18n.T(ctx, i18n.MsgRelayGroupUpstreamSaturated), strings.TrimSuffix(public.Error(), " (request id: request-1)"))
+				assert.Equal(t, "upstream_error", public.ToOpenAIError().Type)
+				assert.Equal(t, "rate_limit_exceeded", public.ToOpenAIError().Code)
+				assert.NotContains(t, public.ToOpenAIError().Message, "org-test-upstream-limited")
+				assert.NotContains(t, public.ToClaudeError().Message, "org-test-upstream-limited")
+				assert.NotContains(t, public.ToOpenAIError().Message, "platform.openai.com")
+			}
+		})
+	}
+}
+
+func TestUpstreamHTTP429BodyDoesNotReachClient(t *testing.T) {
+	const detail = "rate limit exceeded: Rate limit reached for gpt-6.1-sol in organization org-test-upstream-limited on tokens per min (TPM): Limit 40000000, Used 39920237, Requested 203475. Please try again in 185ms. Visit https://platform.openai.com/account/rate-limits to learn more."
+	require.NoError(t, i18n.Init())
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("Accept-Language", "en")
+	messageJSON, err := common.Marshal(detail)
+	require.NoError(t, err)
+	for _, body := range []string{
+		`{"error":{"message":` + string(messageJSON) + `,"type":"tokens","code":"rate_limit_exceeded"}}`,
+		`{"message":` + string(messageJSON) + `}`,
+	} {
+		resp := &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(body))}
+		upstream := service.RelayErrorHandler(ctx.Request.Context(), resp, false)
+		require.NotNil(t, upstream)
+		assert.Equal(t, detail, upstream.Error())
+		public := publicRelayError(ctx, upstream, true)
+		public.SetMessage(common.MessageWithRequestId(public.Error(), "request-1"))
+		assert.Equal(t, http.StatusTooManyRequests, public.StatusCode)
+		assert.NotContains(t, public.ToOpenAIError().Message, "org-test-upstream-limited")
+		assert.Contains(t, public.ToOpenAIError().Message, "The upstream of the current group is at capacity")
+	}
+}
 
 func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
