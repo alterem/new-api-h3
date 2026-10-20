@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -26,18 +27,29 @@ const (
 	InitialScannerBufferSize    = 64 << 10  // 64KB (64*1024)
 	DefaultMaxScannerBufferSize = 128 << 20 // 64MB (64*1024*1024) default SSE buffer size
 	DefaultPingInterval         = 10 * time.Second
-	// streamWriteTimeout bounds a single blocked write to a slow client so the
-	// unconditional wg.Wait() in cleanup can always finish. Without it, a slow
-	// but connected client (full TCP buffer, no server WriteTimeout) could hang
-	// the handler forever.
-	streamWriteTimeout = 30 * time.Second
 )
+
+// streamWriteTimeout bounds a single blocked write to a slow client so the
+// unconditional wg.Wait() in cleanup can always finish. Without it, a slow
+// but connected client (full TCP buffer, no server WriteTimeout) could hang
+// the handler forever.
+var streamWriteTimeout = 30 * time.Second
 
 func getScannerBufferSize() int {
 	if constant.StreamScannerMaxBufferMB > 0 {
 		return constant.StreamScannerMaxBufferMB << 20
 	}
 	return DefaultMaxScannerBufferSize
+}
+
+// ResponsesStartupGuardActive returns whether the native Responses HTTP stream
+// must be inspected before committing the downstream SSE response.
+func ResponsesStartupGuardActive(info *relaycommon.RelayInfo) bool {
+	return constant.ResponsesStreamStartupGuardEnabled &&
+		info != nil &&
+		info.IsStream &&
+		info.RelayMode == relayconstant.RelayModeResponses &&
+		(info.ChannelType == constant.ChannelTypeOpenAI || info.ChannelType == constant.ChannelTypeAzure)
 }
 
 // NewStreamScanner shares relay scanner configuration. Callers buffering bounded
@@ -293,7 +305,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 
 		if err := scanner.Err(); err != nil {
-			if err != io.EOF {
+			// cleanup cancels ctx before closing the body; the read error that
+			// follows is ours, not an upstream failure.
+			if err != io.EOF && ctx.Err() == nil {
 				logger.LogError(c, common.LogText("scanner error: %s", err.Error()))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}
@@ -314,6 +328,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
+	// The deadline set before the last write would otherwise still apply to the
+	// final chunk Go writes after the handler returns. Billing and logging can
+	// outlast it, and the server then drops the connection mid-response, which a
+	// reverse proxy reports as HTTP/2 INTERNAL_ERROR after a completed stream.
+	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, common.LogText("stream ended: %s", info.StreamStatus.Summary()))
 	} else {

@@ -227,6 +227,36 @@ func TestStreamScannerHandler_DoneStopsScanner(t *testing.T) {
 	assert.Equal(t, int64(50), count.Load(), "data after [DONE] must not be processed")
 }
 
+// Post-stream work (billing, logs) must not run into the deadline set before
+// the last stream write; otherwise the server cuts the response before the
+// chunked terminator and the client sees a broken stream after completion.
+func TestStreamScannerHandler_ClearsWriteDeadlineAfterStream(t *testing.T) {
+	oldTimeout := streamWriteTimeout
+	streamWriteTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { streamWriteTimeout = oldTimeout })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := gin.CreateTestContext(w)
+		c.Request = r
+		info := &relaycommon.RelayInfo{DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+		resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {\"n\":1}\n\n"))}
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+			_, _ = c.Writer.WriteString("data: " + data + "\n\n")
+			_ = FlushWriter(c)
+		})
+		time.Sleep(3 * streamWriteTimeout)
+		_, _ = c.Writer.WriteString("data: settled\n\n")
+	}))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "data: {\"n\":1}\n\ndata: settled\n\n", string(body))
+}
+
 func TestStreamScannerHandler_StopStopsStream(t *testing.T) {
 	t.Parallel()
 

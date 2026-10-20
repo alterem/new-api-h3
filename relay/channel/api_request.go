@@ -468,7 +468,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			policy.String())
 	}
 
-	if info.IsStream {
+	if info.IsStream && !helper.ResponsesStartupGuardActive(info) {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()

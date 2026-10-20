@@ -2,15 +2,52 @@ package channel
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResponsesStartupGuardDefersTransportHeaders(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	oldGuard, oldPing, oldInterval := constant.ResponsesStreamStartupGuardEnabled, settings.PingIntervalEnabled, settings.PingIntervalSeconds
+	constant.ResponsesStreamStartupGuardEnabled, settings.PingIntervalEnabled, settings.PingIntervalSeconds = true, true, 1
+	t.Cleanup(func() {
+		constant.ResponsesStreamStartupGuardEnabled, settings.PingIntervalEnabled, settings.PingIntervalSeconds = oldGuard, oldPing, oldInterval
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	for _, channelType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeAzure} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := &relaycommon.RelayInfo{IsStream: true, RelayMode: relayconstant.RelayModeResponses,
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType}}
+		req, err := http.NewRequest(http.MethodPost, upstream.URL, strings.NewReader(`{}`))
+		require.NoError(t, err)
+
+		resp, err := DoRequest(c, req, info)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+
+		assert.False(t, c.Writer.Written())
+		assert.Empty(t, recorder.Body.String())
+		assert.Empty(t, recorder.Header().Get("Content-Type"))
+	}
+}
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	recorder := httptest.NewRecorder()

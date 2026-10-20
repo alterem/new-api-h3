@@ -2,6 +2,8 @@ package openai
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -451,4 +454,298 @@ func TestAzureHostedWebSearch(t *testing.T) {
 			assert.Equal(t, map[string]int{"bing_web_search": 5}, billed)
 		})
 	}
+}
+
+func TestClassifyResponsesStartupError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       types.OpenAIError
+		status    int
+		skipRetry bool
+	}{
+		{name: "rate limit", err: types.OpenAIError{Code: "rate_limit_exceeded"}, status: http.StatusTooManyRequests},
+		{name: "capacity", err: types.OpenAIError{Type: "overloaded_error"}, status: http.StatusServiceUnavailable},
+		{name: "authentication", err: types.OpenAIError{Code: "invalid_api_key"}, status: http.StatusUnauthorized},
+		{name: "permission", err: types.OpenAIError{Code: "permission_denied"}, status: http.StatusForbidden},
+		{name: "invalid request", err: types.OpenAIError{Type: "invalid_request_error"}, status: http.StatusBadRequest, skipRetry: true},
+		{name: "server", err: types.OpenAIError{Code: "server_error"}, status: http.StatusInternalServerError},
+		{name: "numeric rate limit", err: types.OpenAIError{Code: 429}, status: http.StatusTooManyRequests},
+		{name: "numeric capacity", err: types.OpenAIError{Code: 503}, status: http.StatusServiceUnavailable},
+		{name: "numeric authentication", err: types.OpenAIError{Code: 401}, status: http.StatusUnauthorized},
+		{name: "azure rate limit", err: types.OpenAIError{Code: "RateLimitReached"}, status: http.StatusTooManyRequests},
+		{name: "azure too many requests", err: types.OpenAIError{Code: "TooManyRequests"}, status: http.StatusTooManyRequests},
+		{name: "numeric invalid request", err: types.OpenAIError{Code: 400}, status: http.StatusBadRequest, skipRetry: true},
+		{name: "unknown", err: types.OpenAIError{Code: "provider_specific_error"}, status: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, skipRetry := classifyResponsesStartupError(&tt.err)
+			assert.Equal(t, tt.status, status)
+			assert.Equal(t, tt.skipRetry, skipRetry)
+		})
+	}
+}
+func TestOaiResponsesStartupGuardBuffersBeforeCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldEnabled := constant.ResponsesStreamStartupGuardEnabled
+	oldTimeout := constant.StreamingTimeout
+	constant.ResponsesStreamStartupGuardEnabled = true
+	constant.StreamingTimeout = 5
+	t.Cleanup(func() {
+		constant.ResponsesStreamStartupGuardEnabled = oldEnabled
+		constant.StreamingTimeout = oldTimeout
+	})
+
+	sse := func(events ...string) string {
+		return strings.Join(events, "\n\n") + "\n\n"
+	}
+	created := `event: response.created
+data: {"type":"response.created","response":{"id":"r1","status":"in_progress"}}`
+	inProgress := `event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"r1","status":"in_progress"}}`
+	failed := `event: response.failed
+data: {"type":"response.failed","response":{"id":"r1","status":"failed","error":{"code":"rate_limit_exceeded","message":"limited"}}}`
+	completed := `event: response.completed
+data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+
+	t.Run("startup failure returns retryable error without committing SSE", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAzure, UpstreamModelName: "gpt-test"},
+			RelayMode:   relayconstant.RelayModeResponses,
+			IsStream:    true,
+			DisablePing: true,
+		}
+		resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse(created, inProgress, failed))), Header: http.Header{"Content-Type": []string{"text/event-stream"}}}
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+		assert.Empty(t, recorder.Body.String())
+		assert.Empty(t, recorder.Header().Get("Content-Type"))
+	})
+
+	t.Run("successful startup replays buffered events", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-test"},
+			RelayMode:   relayconstant.RelayModeResponses,
+			RelayFormat: types.RelayFormatOpenAIResponses,
+			IsStream:    true,
+			DisablePing: true,
+		}
+		resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse(created, inProgress, completed) + "data: [DONE]\n\n")), Header: http.Header{"Content-Type": []string{"text/event-stream"}}}
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+		require.Nil(t, apiErr)
+		assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+		assert.Contains(t, recorder.Body.String(), `"type":"response.created"`)
+		assert.Contains(t, recorder.Body.String(), `"type":"response.completed"`)
+	})
+
+	t.Run("startup limits are bounded", func(t *testing.T) {
+		events := make([]string, responsesStartupMaxEvents+1)
+		for i := range events {
+			events[i] = created
+		}
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI, UpstreamModelName: "gpt-test"},
+			RelayMode:   relayconstant.RelayModeResponses,
+			IsStream:    true,
+			DisablePing: true,
+		}
+		resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse(events...))), Header: http.Header{"Content-Type": []string{"text/event-stream"}}}
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, resp)
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+		assert.Empty(t, recorder.Body.String())
+	})
+}
+
+func TestResponsesStartupGuardScenarios(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	settings := operation_setting.GetGeneralSetting()
+	oldGuard, oldTimeout := constant.ResponsesStreamStartupGuardEnabled, constant.StreamingTimeout
+	oldPing, oldInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
+	constant.ResponsesStreamStartupGuardEnabled, constant.StreamingTimeout = true, 5
+	t.Cleanup(func() {
+		constant.ResponsesStreamStartupGuardEnabled, constant.StreamingTimeout = oldGuard, oldTimeout
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds = oldPing, oldInterval
+	})
+	newInfo := func(channelType int) *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: channelType, UpstreamModelName: "gpt-test"},
+			RelayMode:   relayconstant.RelayModeResponses,
+			RelayFormat: types.RelayFormatOpenAIResponses,
+			IsStream:    true,
+			DisablePing: true,
+		}
+	}
+	sseResponse := func(body string, header http.Header) *http.Response {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: header}
+	}
+	created := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"failed-attempt\",\"status\":\"in_progress\"}}\n\n"
+
+	// Error shape reported in production: created, in_progress, top-level TPM error, then response.failed.
+	reportedTPM := created +
+		"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"failed-attempt\",\"status\":\"in_progress\"}}\n\n" +
+		`data: {"type":"error","error":{"type":"tokens","code":"rate_limit_exceeded","message":"Rate limit reached for gpt-test on tokens per min (TPM)","param":null}}` + "\n\n" +
+		`data: {"type":"response.failed","response":{"id":"failed-attempt","status":"failed","output":[],"usage":null}}` + "\n\n"
+
+	t.Run("reported TPM error leaks through when the guard is off", func(t *testing.T) {
+		constant.ResponsesStreamStartupGuardEnabled = false
+		t.Cleanup(func() { constant.ResponsesStreamStartupGuardEnabled = true })
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := newInfo(constant.ChannelTypeOpenAI)
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, sseResponse(reportedTPM, make(http.Header)))
+		require.Nil(t, apiErr)
+		assert.Contains(t, recorder.Body.String(), "rate_limit_exceeded")
+		assert.True(t, info.StreamStatus.ResponseFailed())
+	})
+
+	errorCases := []struct {
+		name      string
+		body      string
+		status    int
+		code      string
+		skipRetry bool
+	}{
+		{"reported TPM error", reportedTPM, 429, "rate_limit_exceeded", false},
+		{"flat error", `data: {"type":"error","code":"rate_limit_exceeded","message":"TPM exceeded"}` + "\n\n", 429, "rate_limit_exceeded", false},
+		{"Azure numeric code", `data: {"type":"error","error":{"code":429,"message":"Rate limit reached"}}` + "\n\n", 429, "429", false},
+		{"Azure named code", `data: {"type":"error","error":{"code":"RateLimitReached","message":"Rate limit reached"}}` + "\n\n", 429, "RateLimitReached", false},
+		{"capacity", created + `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"model_at_capacity","message":"Busy"}}}` + "\n\n", 503, "model_at_capacity", false},
+		{"invalid key may fail over", created + `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_api_key","message":"Bad key"}}}` + "\n\n", 401, "invalid_api_key", false},
+		{"invalid input", created + `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"Too long"}}}` + "\n\n", 400, "context_length_exceeded", true},
+		{"premature EOF", created, 502, "startup_stream_ended", false},
+		{"invalid JSON", "data: {invalid\n\n", 502, "startup_invalid_json", false},
+	}
+	for _, channelType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeAzure} {
+		for _, tt := range errorCases {
+			t.Run(fmt.Sprintf("channel_%d/%s", channelType, tt.name), func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				info := newInfo(channelType)
+				header := http.Header{"X-Codex-Turn-State": []string{"failed-state"}}
+
+				usage, apiErr := OaiResponsesStreamHandler(c, info, sseResponse(tt.body, header))
+				require.NotNil(t, apiErr)
+				assert.Nil(t, usage)
+				assert.Equal(t, tt.status, apiErr.StatusCode)
+				assert.Equal(t, types.ErrorCode(tt.code), apiErr.GetErrorCode())
+				assert.Equal(t, tt.skipRetry, types.IsSkipRetryError(apiErr))
+				assert.Equal(t, !tt.skipRetry, service.ShouldRetryRelayError(c, apiErr, 1))
+				assert.False(t, c.Writer.Written())
+				assert.Empty(t, recorder.Body.String())
+				assert.Empty(t, recorder.Header().Get("Content-Type"))
+				assert.Empty(t, recorder.Header().Get("X-Codex-Turn-State"))
+				assert.True(t, info.StreamStatus.ResponseFailed())
+			})
+		}
+	}
+
+	t.Run("retry exposes only the successful attempt", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := newInfo(constant.ChannelTypeOpenAI)
+		limited := created + `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"TPM exceeded"}}}` + "\n\n"
+		succeeded := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"successful-attempt\",\"status\":\"in_progress\"}}\n\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"successful-attempt\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n"
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, sseResponse(limited, http.Header{"X-Reasoning-Included": []string{"failed-state"}}))
+		require.NotNil(t, apiErr)
+		require.True(t, service.ShouldRetryRelayError(c, apiErr, 1))
+		require.False(t, c.Writer.Written())
+
+		usage, apiErr := OaiResponsesStreamHandler(c, info, sseResponse(succeeded, http.Header{"X-Reasoning-Included": []string{"success-state"}}))
+		require.Nil(t, apiErr)
+		require.NotNil(t, usage)
+		assert.Equal(t, 10, usage.PromptTokens)
+		assert.Equal(t, 2, usage.CompletionTokens)
+		assert.NotContains(t, recorder.Body.String(), "failed-attempt")
+		assert.NotContains(t, recorder.Body.String(), "TPM exceeded")
+		assert.Contains(t, recorder.Body.String(), "successful-attempt")
+		assert.Contains(t, recorder.Body.String(), `"delta":"OK"`)
+		assert.Equal(t, []string{"success-state"}, recorder.Header().Values("X-Reasoning-Included"))
+		assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	})
+
+	t.Run("failure after output is not replayed", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		info := newInfo(constant.ChannelTypeOpenAI)
+		body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}\n\n" +
+			"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Late failure\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, sseResponse(body, make(http.Header)))
+		assert.Nil(t, apiErr)
+		assert.Contains(t, recorder.Body.String(), "Partial")
+		assert.Contains(t, recorder.Body.String(), "Late failure")
+		assert.True(t, info.StreamStatus.ResponseFailed())
+	})
+
+	t.Run("terminal event ends the stream while upstream stays open", func(t *testing.T) {
+		for _, guard := range []bool{false, true} {
+			constant.ResponsesStreamStartupGuardEnabled = guard
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := newInfo(constant.ChannelTypeAzure)
+			reader, writer := io.Pipe()
+			go func() {
+				_, _ = io.WriteString(writer, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n")
+				_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n")
+				_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\n")
+			}()
+
+			usage, apiErr := OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: http.StatusOK, Body: reader, Header: make(http.Header)})
+			_ = writer.Close()
+			require.Nil(t, apiErr, "guard=%v", guard)
+			require.NotNil(t, usage)
+			assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason, "guard=%v", guard)
+			assert.False(t, info.StreamStatus.HasErrors(), "guard=%v", guard)
+			assert.Equal(t, 10, usage.PromptTokens)
+			assert.Equal(t, 2, usage.CompletionTokens)
+			assert.Contains(t, recorder.Body.String(), `"type":"response.completed"`)
+		}
+		constant.ResponsesStreamStartupGuardEnabled = true
+	})
+
+	t.Run("client cancellation during startup sends no ping", func(t *testing.T) {
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds = true, 1
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+		info := newInfo(constant.ChannelTypeOpenAI)
+		info.DisablePing = false
+		reader, writer := io.Pipe()
+		defer writer.Close()
+		go func() {
+			_, _ = io.WriteString(writer, created)
+		}()
+
+		_, apiErr := OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: http.StatusOK, Body: reader, Header: make(http.Header)})
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusRequestTimeout, apiErr.StatusCode)
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.False(t, c.Writer.Written())
+		assert.Empty(t, recorder.Body.String())
+	})
 }

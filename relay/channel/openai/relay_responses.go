@@ -74,6 +74,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+	if apiErr := guardResponsesStartupStream(c, info, resp); apiErr != nil {
+		// The scanner never ran, so this failed attempt owns its own status.
+		info.StreamStatus = relaycommon.NewStreamStatus()
+		info.StreamStatus.MarkFailed(string(apiErr.GetErrorCode()), string(apiErr.GetErrorType()), apiErr.StatusCode)
+		return nil, apiErr
+	}
 
 	accumulator := service.NewResponsesUsageAccumulator(info)
 
@@ -91,6 +97,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		sendResponsesStreamData(c, streamResponse, data)
 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
+		switch streamResponse.Type {
+		case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+			// The protocol ends here. Waiting for the upstream to close the
+			// connection keeps the client open for nothing and turns a late
+			// upstream reset into a scanner error on a finished response.
+			sr.Done()
+		}
 	})
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
